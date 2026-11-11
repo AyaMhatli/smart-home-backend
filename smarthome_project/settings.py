@@ -173,4 +173,12 @@ if os.environ.get('SMARTHOME_LOCAL') == '1':
     DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3'}}
     MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
     MQTT_USER = os.environ.get('MQTT_USER', 'aya')
-    MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD', 'dev')
+    MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD', 'dev')  
+ # --- Base de données : toujours SQLite (PC et Pi) ---
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {'timeout': 20, 'init_command': 'PRAGMA journal_mode=WAL;'},
+    }
+}
