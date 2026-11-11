@@ -1,0 +1,186 @@
+# devices/views.py
+from datetime import timedelta
+
+from django.utils import timezone
+from rest_framework import status, viewsets
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+
+from .models import Device, Home, SensorReading
+from .mqtt import publish_command
+from .integrations import get_driver, refresh_integration_status, IntegrationError
+from .integrations.discovery import identify
+from .validation import valid_lan_host
+from .serializers import DeviceSerializer, HomeSerializer, RegisterSerializer
+
+# action -> (clé d'état modifiée, valeur)
+COMMANDS = {
+    'on': ('on', True), 'off': ('on', False),
+    'lock': ('locked', True), 'unlock': ('locked', False),
+    'set_speed': ('value', None), 'set_angle': ('value', None),
+}
+
+
+class DeviceViewSet(viewsets.ModelViewSet):
+    """GET/POST /api/devices/ , GET/PUT/DELETE /api/devices/<id>/"""
+    serializer_class = DeviceSerializer
+
+    def get_queryset(self):
+        qs = Device.objects.filter(owner=self.request.user)
+        home = self.request.query_params.get('home')
+        if home:
+            qs = qs.filter(home_id=home)
+        return qs.order_by('name')
+
+    @action(detail=False, methods=['post'])
+    def probe(self, request):
+        """POST /api/devices/probe/ {"host": "192.168.1.20"} : reconnaît une télé Samsung ou une bande WLED."""
+        host = (request.data.get('host') or '').strip()
+        if not valid_lan_host(host):
+            return Response({'error': 'Adresse invalide : une adresse du réseau local est attendue.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        found = identify(host)
+        if not found:
+            return Response({'found': False})
+        return Response({'found': True, **found})
+
+    def list(self, request, *args, **kwargs):
+        # Met à jour « en ligne » des appareils du commerce avant de répondre
+        refresh_integration_status(list(self.get_queryset()))
+        return super().list(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        home = serializer.validated_data.get("home")
+        if home is not None and home.owner_id != self.request.user.id:
+            raise PermissionDenied("Ce foyer ne vous appartient pas.")
+        serializer.save(owner=self.request.user)
+
+    @action(detail=True, methods=['post'])
+    def command(self, request, pk=None):
+        """POST /api/devices/<id>/command/  {"action": "on"} ou {"action": "set_speed", "value": 40}"""
+        device = self.get_object()
+        name = request.data.get('action')
+        value = request.data.get('value')
+
+        # Appareil du commerce (Samsung TV, WLED...) : pas de MQTT
+        try:
+            driver = get_driver(device)
+            if driver:
+                device.state.update(driver.execute(name, value))
+                device.is_online = True
+                device.save()
+                return Response(DeviceSerializer(device).data)
+        except IntegrationError as e:
+            if device.is_online:
+                device.is_online = False
+                device.save(update_fields=['is_online'])
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if name not in COMMANDS:
+            return Response({'error': 'Action inconnue'}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = {'action': name}
+        if value is not None:
+            payload['value'] = value
+        try:
+            publish_command(device.mqtt_topic, payload)
+        except Exception:
+            return Response({'error': 'Broker MQTT injoignable'},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        key, fixed = COMMANDS[name]
+        device.state[key] = value if fixed is None else fixed
+        device.save()
+        return Response(DeviceSerializer(device).data)
+
+
+@api_view(['GET'])
+def summary(request):
+    """GET /api/summary/?home=<id> : données de l'écran Accueil."""
+    home_id = _home_scope(request)
+    devices = Device.objects.filter(owner=request.user)
+    readings = SensorReading.objects.filter(device__owner=request.user,
+                                            temperature__isnull=False)
+    if home_id is not None:
+        devices = devices.filter(home_id=home_id)
+        readings = readings.filter(device__home_id=home_id)
+    last = readings.first()
+    lights = devices.filter(device_type='light')
+    doors = devices.filter(device_type='door')
+    return Response({
+        'temperature': last.temperature if last else None,
+        'humidity': last.humidity if last else None,
+        'lights_on': sum(1 for d in lights if d.state.get('on')),
+        'lights_total': lights.count(),
+        'doors_locked': all(d.state.get('locked', True) for d in doors),
+        'devices_total': devices.count(),
+        'devices_online': devices.filter(is_online=True).count(),
+    })
+
+
+@api_view(['GET'])
+def sensor_history(request):
+    """GET /api/sensors/history/?period=24h|7j|30j&home=<id> : écran Monitoring."""
+    home_id = _home_scope(request)
+    days = {'24h': 1, '7j': 7, '7d': 7, '30j': 30, '30d': 30}.get(
+        request.query_params.get('period', '24h'), 1)
+    since = timezone.now() - timedelta(days=days)
+    readings = SensorReading.objects.filter(device__owner=request.user, timestamp__gte=since)
+    if home_id is not None:
+        readings = readings.filter(device__home_id=home_id)
+    readings = readings.order_by('timestamp')[:500]
+    return Response([{'timestamp': r.timestamp, 'temperature': r.temperature,
+                      'humidity': r.humidity} for r in readings])
+
+
+@api_view(['GET'])
+def me(request):
+    """GET /api/me/ : données de l'écran Profil."""
+    devices = Device.objects.filter(owner=request.user)
+    return Response({
+        'name': request.user.first_name,
+        'email': request.user.email,
+        'devices_total': devices.count(),
+        'devices_online': devices.filter(is_online=True).count(),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def register(request):
+    """POST /api/auth/register/ {"name", "email", "password"} : écran Inscription."""
+    serializer = RegisterSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response({'message': 'Compte créé'}, status=status.HTTP_201_CREATED)
+
+
+class HomeViewSet(viewsets.ModelViewSet):
+    """GET/POST /api/homes/ , GET/PUT/DELETE /api/homes/<id>/"""
+    serializer_class = HomeSerializer
+
+    def get_queryset(self):
+        return Home.objects.filter(owner=self.request.user).order_by('name')
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
+
+
+# --- home-scope ---
+def _home_scope(request):
+    """Retourne l'identifiant de la maison demandée (?home=), ou None pour toutes.
+    Refuse une maison qui n'appartient pas à l'utilisateur."""
+    from rest_framework.exceptions import NotFound, ValidationError
+    from .models import Home
+    raw = request.query_params.get('home')
+    if raw in (None, ''):
+        return None
+    try:
+        home_id = int(raw)
+    except ValueError:
+        raise ValidationError({'home': 'Identifiant de maison invalide.'})
+    if not Home.objects.filter(id=home_id, owner=request.user).exists():
+        raise NotFound('Maison introuvable.')
+    return home_id
